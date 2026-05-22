@@ -1,0 +1,166 @@
+version: "3.9"
+
+# =============================================================================
+# DrillWatch — Industrial Predictive Maintenance Stack
+# Services: RabbitMQ | Producer | Consumer | FastAPI | React Dashboard
+# =============================================================================
+
+networks:
+  drillnet:
+    driver: bridge
+
+volumes:
+  rabbitmq_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MESSAGE BROKER — RabbitMQ 3.12 (Management UI enabled)
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: drillwatch-rabbitmq
+    restart: unless-stopped
+    networks:
+      - drillnet
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI → http://localhost:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./infra/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # PRODUCER — Telemetry Simulation Engine
+  # Publishes synthetic drilling telemetry with sensor drift to RabbitMQ
+  # ---------------------------------------------------------------------------
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: drillwatch-producer
+    restart: unless-stopped
+    networks:
+      - drillnet
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-drill.telemetry}
+      RABBITMQ_EXCHANGE: drill.exchange
+      TELEMETRY_INTERVAL: ${TELEMETRY_INTERVAL:-1.0}
+      DRIFT_START_STEP: ${DRIFT_START_STEP:-200}
+      ASSET_ID: ${ASSET_ID:-DRILLRIG-NOV-001}
+      LOG_LEVEL: INFO
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # CONSUMER — Anomaly Detector + RUL Predictor
+  # Subscribes to RabbitMQ, runs 3σ anomaly detection, pushes to FastAPI
+  # ---------------------------------------------------------------------------
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: drillwatch-consumer
+    restart: unless-stopped
+    networks:
+      - drillnet
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-drill.telemetry}
+      API_HOST: api
+      API_PORT: ${API_PORT:-8000}
+      ANOMALY_WINDOW: ${ANOMALY_WINDOW:-30}
+      ALERT_SIGMA_THRESHOLD: ${ALERT_SIGMA_THRESHOLD:-3.0}
+      LOG_LEVEL: INFO
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # FASTAPI BACKEND — REST API with In-Memory Telemetry Cache
+  # Exposes /telemetry, /alerts, /health endpoints
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: drillwatch-api
+    restart: unless-stopped
+    networks:
+      - drillnet
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      CACHE_MAX_SIZE: ${CACHE_MAX_SIZE:-100}
+      MAX_ALERTS: ${MAX_ALERTS:-50}
+      LOG_LEVEL: INFO
+      ALLOWED_ORIGINS: "http://localhost:5173,http://localhost:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # REACT DASHBOARD — Industrial Operations Dashboard
+  # Vite + Tailwind + Recharts, polls FastAPI for live data
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Vite bakes these at BUILD time — must be passed as build args, not env
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        VITE_POLL_INTERVAL_MS: ${VITE_POLL_INTERVAL_MS:-2000}
+    container_name: drillwatch-frontend
+    restart: unless-stopped
+    networks:
+      - drillnet
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M

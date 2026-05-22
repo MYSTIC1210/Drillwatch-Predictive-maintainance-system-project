@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+LABEL maintainer="DrillWatch Engineering"
+LABEL description="Telemetry Simulation Producer — DrillWatch PdM System"
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies first (layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY producer.py .
+
+# Non-root user for security
+RUN useradd -m -u 1001 drillwatch
+USER drillwatch
+
+CMD ["python", "-u", "producer.py"]
